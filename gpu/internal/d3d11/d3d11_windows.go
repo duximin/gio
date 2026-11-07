@@ -61,6 +61,11 @@ type Texture struct {
 	height  int
 	mipmap  bool
 	foreign bool
+
+	minFilter driver.TextureFilter
+	magFilter driver.TextureFilter
+	keyed     *d3d11.KeyedMutex
+	keyedHeld bool
 }
 
 type VertexShader struct {
@@ -341,6 +346,144 @@ func (b *Backend) NewTexture(format driver.TextureFormat, width, height int, min
 		}
 	}
 	return &Texture{backend: b, format: d3dfmt, tex: tex, sampler: sampler, resView: resView, uaView: uaView, renderTarget: fbo, bindings: bindings, width: width, height: height, mipmap: mipmap}, nil
+}
+
+// NewSharedTexture opens a HANDLE shared from another D3D11 device and
+// samples it as BGRA. The texture must use a keyed mutex. The renderer takes
+// key 1 with AcquireShared before each frame samples it and hands it back
+// with ReleaseShared, so the texture stays open across frames.
+func (b *Backend) NewSharedTexture(handle uintptr, width, height int, minFilter, magFilter driver.TextureFilter) (driver.Texture, error) {
+	if handle == 0 || width < 1 || height < 1 {
+		return nil, fmt.Errorf("d3d11: shared texture %dx%d handle=%#x", width, height, handle)
+	}
+	unk, err := b.dev.OpenSharedResource(handle, &d3d11.IID_Texture2D)
+	if err != nil {
+		return nil, fmt.Errorf("d3d11: OpenSharedResource: %w", err)
+	}
+	tex := (*d3d11.Texture2D)(unsafe.Pointer(unk))
+	kunk, err := d3d11.IUnknownQueryInterface(unsafe.Pointer(tex), tex.Vtbl.QueryInterface, &d3d11.IID_IDXGIKeyedMutex)
+	if err != nil {
+		d3d11.IUnknownRelease(unsafe.Pointer(tex), tex.Vtbl.Release)
+		return nil, fmt.Errorf("d3d11: keyed mutex: %w", err)
+	}
+	keyed := (*d3d11.KeyedMutex)(unsafe.Pointer(kunk))
+	sampler, err := newSampler(b.dev, minFilter, magFilter)
+	if err != nil {
+		d3d11.IUnknownRelease(unsafe.Pointer(keyed), keyed.Vtbl.Release)
+		d3d11.IUnknownRelease(unsafe.Pointer(tex), tex.Vtbl.Release)
+		return nil, err
+	}
+	resView, err := newBGRAView(b.dev, tex)
+	if err != nil {
+		d3d11.IUnknownRelease(unsafe.Pointer(sampler), sampler.Vtbl.Release)
+		d3d11.IUnknownRelease(unsafe.Pointer(keyed), keyed.Vtbl.Release)
+		d3d11.IUnknownRelease(unsafe.Pointer(tex), tex.Vtbl.Release)
+		return nil, err
+	}
+	return &Texture{
+		backend:   b,
+		format:    d3d11.DXGI_FORMAT_B8G8R8A8_UNORM,
+		tex:       tex,
+		sampler:   sampler,
+		resView:   resView,
+		bindings:  driver.BufferBindingTexture,
+		width:     width,
+		height:    height,
+		minFilter: minFilter,
+		magFilter: magFilter,
+		keyed:     keyed,
+	}, nil
+}
+
+// AcquireShared takes key 1, which the producer releases once a picture is
+// written.
+func (t *Texture) AcquireShared() error {
+	if t.keyed == nil || t.keyedHeld {
+		return nil
+	}
+	if err := t.keyed.AcquireSync(1, 32); err != nil {
+		return fmt.Errorf("d3d11: AcquireSync: %w", err)
+	}
+	t.keyedHeld = true
+	return nil
+}
+
+// ReleaseShared hands key 1 back once the frame's draws are recorded. The
+// picture stays published: the next frame can sample it again and the
+// producer can reclaim the slot when it is no longer the latest.
+func (t *Texture) ReleaseShared() {
+	if t.keyedHeld {
+		_ = t.keyed.ReleaseSync(1)
+		t.keyedHeld = false
+	}
+}
+
+func (t *Texture) SetFilter(minFilter, magFilter driver.TextureFilter) error {
+	if t.sampler != nil && t.minFilter == minFilter && t.magFilter == magFilter {
+		return nil
+	}
+	sampler, err := newSampler(t.backend.dev, minFilter, magFilter)
+	if err != nil {
+		return err
+	}
+	if t.sampler != nil {
+		d3d11.IUnknownRelease(unsafe.Pointer(t.sampler), t.sampler.Vtbl.Release)
+	}
+	t.sampler = sampler
+	t.minFilter = minFilter
+	t.magFilter = magFilter
+	return nil
+}
+
+func newSampler(dev *d3d11.Device, minFilter, magFilter driver.TextureFilter) (*d3d11.SamplerState, error) {
+	var filter uint32
+	switch {
+	case minFilter == driver.FilterNearest && magFilter == driver.FilterNearest:
+		filter = d3d11.FILTER_MIN_MAG_MIP_POINT
+	case minFilter == driver.FilterLinear && magFilter == driver.FilterLinear:
+		filter = d3d11.FILTER_MIN_MAG_LINEAR_MIP_POINT
+	case minFilter == driver.FilterLinearMipmapLinear && magFilter == driver.FilterLinear:
+		filter = d3d11.FILTER_MIN_MAG_MIP_LINEAR
+	default:
+		return nil, fmt.Errorf("d3d11: unsupported texture filter combination %d, %d", minFilter, magFilter)
+	}
+	return dev.CreateSamplerState(&d3d11.SAMPLER_DESC{
+		Filter:        filter,
+		AddressU:      d3d11.TEXTURE_ADDRESS_CLAMP,
+		AddressV:      d3d11.TEXTURE_ADDRESS_CLAMP,
+		AddressW:      d3d11.TEXTURE_ADDRESS_CLAMP,
+		MaxAnisotropy: 1,
+		MinLOD:        -math.MaxFloat32,
+		MaxLOD:        math.MaxFloat32,
+	})
+}
+
+func newBGRAView(dev *d3d11.Device, tex *d3d11.Texture2D) (*d3d11.ShaderResourceView, error) {
+	formats := []uint32{
+		d3d11.DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+		d3d11.DXGI_FORMAT_B8G8R8A8_UNORM,
+	}
+	var last error
+	for _, format := range formats {
+		view, err := dev.CreateShaderResourceView(
+			(*d3d11.Resource)(unsafe.Pointer(tex)),
+			unsafe.Pointer(&d3d11.SHADER_RESOURCE_VIEW_DESC_TEX2D{
+				SHADER_RESOURCE_VIEW_DESC: d3d11.SHADER_RESOURCE_VIEW_DESC{
+					Format:        format,
+					ViewDimension: d3d11.SRV_DIMENSION_TEXTURE2D,
+				},
+				Texture2D: d3d11.TEX2D_SRV{
+					MostDetailedMip: 0,
+					MipLevels:       1,
+				},
+			}),
+		)
+		if err == nil {
+			return view, nil
+		}
+		last = err
+	}
+	return nil, last
 }
 
 func (b *Backend) newInputLayout(vertexShader shader.Sources, layout []driver.InputDesc) (*d3d11.InputLayout, error) {
@@ -632,6 +775,11 @@ func (t *Texture) Upload(offset, size image.Point, pixels []byte, stride int) {
 func (t *Texture) Release() {
 	if t.foreign {
 		panic("texture not created by NewTexture")
+	}
+	t.ReleaseShared()
+	if t.keyed != nil {
+		d3d11.IUnknownRelease(unsafe.Pointer(t.keyed), t.keyed.Vtbl.Release)
+		t.keyed = nil
 	}
 	if t.renderTarget != nil {
 		d3d11.IUnknownRelease(unsafe.Pointer(t.renderTarget), t.renderTarget.Vtbl.Release)
