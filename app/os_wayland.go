@@ -170,6 +170,8 @@ type window struct {
 	}
 	pointerBtns pointer.Buttons
 	lastPos     f32.Point
+	lastMoveAt  time.Duration
+	lastMovePos f32.Point
 	lastTouch   f32.Point
 	textInput   bool
 	inputHint   key.InputHint
@@ -893,7 +895,7 @@ func gio_onPointerEnter(data unsafe.Pointer, pointer *C.struct_wl_pointer, seria
 	w := callbackLoad(unsafe.Pointer(surf)).(*window)
 	s.pointerFocus = w
 	w.setCursor(pointer, serial)
-	w.lastPos = f32.Point{X: fromFixed(x), Y: fromFixed(y)}
+	w.lastPos = f32.Point{X: fromFixed(x) * float32(w.scale), Y: fromFixed(y) * float32(w.scale)}
 }
 
 //export gio_onPointerLeave
@@ -950,12 +952,27 @@ func gio_onPointerButton(data unsafe.Pointer, p *C.struct_wl_pointer, serial, t,
 			return
 		}
 		act, ok := w.w.ActionAt(w.lastPos)
-		if ok && w.config.Mode == Windowed {
-			switch act {
-			case system.ActionMove:
-				w.move(serial)
+		// Double-click on ActionMove toggles maximize.
+		if ok && act == system.ActionMove && w.config.Mode != Fullscreen {
+			const doubleClick = 400 * time.Millisecond
+			now := time.Duration(t) * time.Millisecond
+			dx := w.lastPos.X - w.lastMovePos.X
+			dy := w.lastPos.Y - w.lastMovePos.Y
+			if w.lastMoveAt != 0 && now-w.lastMoveAt < doubleClick && dx*dx+dy*dy < 36 {
+				w.lastMoveAt = 0
+				if w.config.Mode == Maximized {
+					w.Configure([]Option{Windowed.Option()})
+				} else {
+					w.Configure([]Option{Maximized.Option()})
+				}
 				return
 			}
+			w.lastMoveAt = now
+			w.lastMovePos = w.lastPos
+			if w.config.Mode == Windowed {
+				w.move(serial)
+			}
+			return
 		}
 	}
 	var kind pointer.Kind

@@ -108,6 +108,11 @@ type x11Window struct {
 	animating bool
 
 	pointerBtns pointer.Buttons
+	lastMoveAt  time.Duration
+	lastMovePos f32.Point
+	dragging    bool
+	dragOffX    int
+	dragOffY    int
 
 	clipboard clipboardContent
 	cursor    pointer.Cursor
@@ -172,8 +177,6 @@ func (w *x11Window) Configure(options []Option) {
 	prev := w.config
 	cnf := w.config
 	cnf.apply(w.metric, options)
-	// Decorations are never disabled.
-	cnf.Decorated = true
 
 	switch cnf.Mode {
 	case Fullscreen:
@@ -241,6 +244,7 @@ func (w *x11Window) Configure(options []Option) {
 	}
 	if cnf.Decorated != prev.Decorated {
 		w.config.Decorated = cnf.Decorated
+		w.setMotifDecorations(cnf.Decorated)
 	}
 	w.ProcessEvent(ConfigEvent{Config: w.config})
 }
@@ -704,13 +708,45 @@ func (h *x11EventHandler) handleEvents() bool {
 			switch _type {
 			case C.ButtonPress:
 				w.pointerBtns |= btn
+				// Client chrome ActionMove: drag undecorated window.
+				if bevt.button == C.Button1 {
+					pos := f32.Point{X: float32(bevt.x), Y: float32(bevt.y)}
+					if act, ok := w.w.ActionAt(pos); ok && act == system.ActionMove && w.config.Mode != Fullscreen {
+						const doubleClick = 400 * time.Millisecond
+						now := time.Duration(bevt.time) * time.Millisecond
+						dx := pos.X - w.lastMovePos.X
+						dy := pos.Y - w.lastMovePos.Y
+						if w.lastMoveAt != 0 && now-w.lastMoveAt < doubleClick && dx*dx+dy*dy < 36 {
+							w.lastMoveAt = 0
+							if w.config.Mode == Maximized {
+								w.Configure([]Option{Windowed.Option()})
+							} else {
+								w.Configure([]Option{Maximized.Option()})
+							}
+							continue
+						}
+						w.lastMoveAt = now
+						w.lastMovePos = pos
+						if w.config.Mode == Windowed {
+							w.beginDrag(bevt)
+						}
+						continue
+					}
+				}
 			case C.ButtonRelease:
 				w.pointerBtns &^= btn
+				if bevt.button == C.Button1 {
+					w.endDrag()
+				}
 			}
 			ev.Buttons = w.pointerBtns
 			w.ProcessEvent(ev)
 		case C.MotionNotify:
 			mevt := (*C.XMotionEvent)(unsafe.Pointer(xev))
+			if w.dragging {
+				w.dragTo(int(mevt.x_root), int(mevt.y_root))
+				continue
+			}
 			w.ProcessEvent(pointer.Event{
 				Kind:    pointer.Move,
 				Source:  pointer.Mouse,
@@ -849,6 +885,42 @@ func init() {
 	x11Driver = newX11Window
 }
 
+func (w *x11Window) setMotifDecorations(decorated bool) {
+	atom := w.atom("_MOTIF_WM_HINTS", false)
+	if atom == 0 {
+		return
+	}
+	// flags bit 1 = MWM_HINTS_DECORATIONS; decorations 0 hides the frame.
+	hints := [5]C.long{2, 0, 0, 0, 0}
+	if decorated {
+		hints[2] = 1
+	}
+	C.XChangeProperty(w.x, w.xw, atom, atom, 32, C.PropModeReplace,
+		(*C.uchar)(unsafe.Pointer(&hints[0])), 5)
+}
+
+func (w *x11Window) beginDrag(bevt *C.XButtonEvent) {
+	w.dragging = true
+	w.dragOffX = int(bevt.x)
+	w.dragOffY = int(bevt.y)
+	C.XGrabPointer(w.x, w.xw, C.False,
+		C.ButtonPressMask|C.ButtonReleaseMask|C.PointerMotionMask,
+		C.GrabModeAsync, C.GrabModeAsync, C.None, C.None, C.CurrentTime)
+}
+
+func (w *x11Window) endDrag() {
+	if !w.dragging {
+		return
+	}
+	w.dragging = false
+	C.XUngrabPointer(w.x, C.CurrentTime)
+	C.XFlush(w.x)
+}
+
+func (w *x11Window) dragTo(rootX, rootY int) {
+	C.XMoveWindow(w.x, w.xw, C.int(rootX-w.dragOffX), C.int(rootY-w.dragOffY))
+}
+
 func newX11Window(gioWin *callbacks, options []Option) error {
 	var err error
 
@@ -961,9 +1033,12 @@ func newX11Window(gioWin *callbacks, options []Option) error {
 		w.ibus, _ = ibus.Start(C.GoString(C.XDisplayString(dpy)), (*ibusEventHandler)(w))
 	}
 
-	// make the window visible on the screen
-	C.XMapWindow(dpy, win)
+	// Apply size and decoration hints before mapping so the WM sees them.
 	w.Configure(options)
+	if !w.config.Decorated {
+		w.setMotifDecorations(false)
+	}
+	C.XMapWindow(dpy, win)
 	w.ProcessEvent(X11ViewEvent{Display: unsafe.Pointer(dpy), Window: uintptr(win)})
 	return nil
 }

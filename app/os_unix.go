@@ -59,7 +59,7 @@ var wlDriver, x11Driver windowDriver
 
 func newWindow(window *callbacks, options []Option) {
 	var errFirst error
-	for _, d := range []windowDriver{wlDriver, x11Driver} {
+	for _, d := range []windowDriver{x11Driver, wlDriver} {
 		if d == nil {
 			continue
 		}
