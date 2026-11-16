@@ -1931,34 +1931,27 @@ func (w *window) systemGesture() (*C.struct_wl_cursor, C.uint32_t) {
 		return nil, 0
 	}
 	_, cfg := w.getConfig()
-	border := cfg.Dp(3)
-	x, y, size := int(w.lastPos.X), int(w.lastPos.Y), w.config.Size
-	north := y <= border
-	south := y >= size.Y-border
-	west := x <= border
-	east := x >= size.X-border
-
-	switch {
-	default:
-		fallthrough
-	case !north && !south && !west && !east:
-		return nil, 0
-	case north && west:
+	border := cfg.Dp(resizeBorderDp)
+	dir := hitResize(int(w.lastPos.X), int(w.lastPos.Y), w.config.Size.X, w.config.Size.Y, border)
+	switch dir {
+	case resizeTopLeft:
 		return w.cursor.cursors.resizeNorthWest, C.XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT
-	case north && east:
-		return w.cursor.cursors.resizeNorthEast, C.XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT
-	case south && west:
-		return w.cursor.cursors.resizeSouthWest, C.XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT
-	case south && east:
-		return w.cursor.cursors.resizeSouthEast, C.XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT
-	case north:
+	case resizeTop:
 		return w.cursor.cursors.resizeNorth, C.XDG_TOPLEVEL_RESIZE_EDGE_TOP
-	case south:
-		return w.cursor.cursors.resizeSouth, C.XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM
-	case west:
-		return w.cursor.cursors.resizeWest, C.XDG_TOPLEVEL_RESIZE_EDGE_LEFT
-	case east:
+	case resizeTopRight:
+		return w.cursor.cursors.resizeNorthEast, C.XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT
+	case resizeRight:
 		return w.cursor.cursors.resizeEast, C.XDG_TOPLEVEL_RESIZE_EDGE_RIGHT
+	case resizeBottomRight:
+		return w.cursor.cursors.resizeSouthEast, C.XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT
+	case resizeBottom:
+		return w.cursor.cursors.resizeSouth, C.XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM
+	case resizeBottomLeft:
+		return w.cursor.cursors.resizeSouthWest, C.XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT
+	case resizeLeft:
+		return w.cursor.cursors.resizeWest, C.XDG_TOPLEVEL_RESIZE_EDGE_LEFT
+	default:
+		return nil, 0
 	}
 }
 

@@ -99,6 +99,8 @@ type x11Window struct {
 		wmStateMaximizedHorz C.Atom
 		// _NET_WM_STATE_MAXIMIZED_VERT
 		wmStateMaximizedVert C.Atom
+		// _NET_WM_MOVERESIZE
+		wmMoveResize C.Atom
 	}
 	metric unit.Metric
 	notify struct {
@@ -113,6 +115,9 @@ type x11Window struct {
 	dragging    bool
 	dragOffX    int
 	dragOffY    int
+	// edgeDir is the resize strip under the pointer. resizeNone means the
+	// application cursor is showing.
+	edgeDir resizeDir
 
 	clipboard clipboardContent
 	cursor    pointer.Cursor
@@ -321,7 +326,9 @@ func (w *x11Window) raise() {
 func (w *x11Window) SetCursor(cursor pointer.Cursor) {
 	if cursor == pointer.CursorNone {
 		w.cursor = cursor
-		C.XFixesHideCursor(w.x, w.xw)
+		if w.edgeDir == resizeNone {
+			C.XFixesHideCursor(w.x, w.xw)
+		}
 		return
 	}
 
@@ -333,8 +340,23 @@ func (w *x11Window) SetCursor(cursor pointer.Cursor) {
 		cursor = pointer.CursorDefault
 	}
 	w.cursor = cursor
-	// If c if null (i.e. cursor was not found),
+	if w.edgeDir != resizeNone {
+		return
+	}
+	// If c is null (i.e. cursor was not found),
 	// XDefineCursor will use the default cursor.
+	C.XDefineCursor(w.x, w.xw, c)
+}
+
+func (w *x11Window) defineXCursor(cursor pointer.Cursor) {
+	if cursor == pointer.CursorNone {
+		C.XFixesHideCursor(w.x, w.xw)
+		return
+	}
+	xcursor := xCursor[cursor]
+	cname := C.CString(xcursor)
+	defer C.free(unsafe.Pointer(cname))
+	c := C.XcursorLibraryLoadCursor(w.x, cname)
 	C.XDefineCursor(w.x, w.xw, c)
 }
 
@@ -708,9 +730,14 @@ func (h *x11EventHandler) handleEvents() bool {
 			switch _type {
 			case C.ButtonPress:
 				w.pointerBtns |= btn
-				// Client chrome ActionMove: drag undecorated window.
 				if bevt.button == C.Button1 {
 					pos := f32.Point{X: float32(bevt.x), Y: float32(bevt.y)}
+					// Edge wins over the title-bar move area so the top strip resizes.
+					if dir := w.resizeDirAt(int(bevt.x), int(bevt.y)); dir != resizeNone {
+						w.beginResize(bevt, dir)
+						continue
+					}
+					// Client chrome ActionMove: drag undecorated window.
 					if act, ok := w.w.ActionAt(pos); ok && act == system.ActionMove && w.config.Mode != Fullscreen {
 						const doubleClick = 400 * time.Millisecond
 						now := time.Duration(bevt.time) * time.Millisecond
@@ -747,6 +774,7 @@ func (h *x11EventHandler) handleEvents() bool {
 				w.dragTo(int(mevt.x_root), int(mevt.y_root))
 				continue
 			}
+			w.trackResizeCursor(int(mevt.x), int(mevt.y))
 			w.ProcessEvent(pointer.Event{
 				Kind:    pointer.Move,
 				Source:  pointer.Mouse,
@@ -921,6 +949,58 @@ func (w *x11Window) dragTo(rootX, rootY int) {
 	C.XMoveWindow(w.x, w.xw, C.int(rootX-w.dragOffX), C.int(rootY-w.dragOffY))
 }
 
+func (w *x11Window) resizeDirAt(x, y int) resizeDir {
+	if w.config.Mode != Windowed || w.config.Decorated {
+		return resizeNone
+	}
+	border := w.metric.Dp(resizeBorderDp)
+	if border < 1 {
+		border = 1
+	}
+	return hitResize(x, y, w.config.Size.X, w.config.Size.Y, border)
+}
+
+func (w *x11Window) trackResizeCursor(x, y int) {
+	dir := w.resizeDirAt(x, y)
+	if dir == w.edgeDir {
+		return
+	}
+	w.edgeDir = dir
+	if dir == resizeNone {
+		w.defineXCursor(w.cursor)
+		return
+	}
+	w.defineXCursor(dir.cursor())
+}
+
+// beginResize asks the window manager to run an interactive resize.
+// Min and max size hints already set on the window still apply.
+func (w *x11Window) beginResize(bevt *C.XButtonEvent, dir resizeDir) {
+	var xev C.XEvent
+	ev := (*C.XClientMessageEvent)(unsafe.Pointer(&xev))
+	*ev = C.XClientMessageEvent{
+		_type:        C.ClientMessage,
+		display:      w.x,
+		window:       w.xw,
+		message_type: w.atoms.wmMoveResize,
+		format:       32,
+	}
+	data := (*[5]C.long)(unsafe.Pointer(&ev.data))
+	data[0] = C.long(bevt.x_root)
+	data[1] = C.long(bevt.y_root)
+	data[2] = C.long(dir.ewmhDir())
+	data[3] = C.long(bevt.button)
+	data[4] = 1 // application
+	C.XSendEvent(
+		w.x,
+		C.XDefaultRootWindow(w.x),
+		C.False,
+		C.SubstructureNotifyMask|C.SubstructureRedirectMask,
+		&xev,
+	)
+	C.XFlush(w.x)
+}
+
 func newX11Window(gioWin *callbacks, options []Option) error {
 	var err error
 
@@ -1024,6 +1104,7 @@ func newX11Window(gioWin *callbacks, options []Option) error {
 	w.atoms.wmActiveWindow = w.atom("_NET_ACTIVE_WINDOW", false)
 	w.atoms.wmStateMaximizedHorz = w.atom("_NET_WM_STATE_MAXIMIZED_HORZ", false)
 	w.atoms.wmStateMaximizedVert = w.atom("_NET_WM_STATE_MAXIMIZED_VERT", false)
+	w.atoms.wmMoveResize = w.atom("_NET_WM_MOVERESIZE", false)
 
 	// extensions
 	C.XSetWMProtocols(dpy, win, &w.atoms.evDelWindow, 1)
