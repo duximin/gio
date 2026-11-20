@@ -8,8 +8,11 @@
 
 __attribute__ ((visibility ("hidden"))) Class gio_layerClass(void);
 
-@interface GioView: UIView <UIKeyInput>
+@interface GioView: UIView <UIKeyInput, UITextFieldDelegate>
 @property uintptr_t handle;
+// gioField is the software-keyboard target. A Metal-backed view that only
+// adopts UIKeyInput does not receive insertText: from the iOS keyboard.
+@property (nonatomic, strong) UITextField *gioField;
 @end
 
 @implementation GioViewController
@@ -117,8 +120,94 @@ static void handleTouches(int last, GioView *view, NSSet<UITouch *> *touches, UI
 	}
 }
 
+// gioSentinel stays in the field so a backspace still produces a change
+// after the visible text has been deleted. Gio owns the real caret.
+static NSString *const gioSentinel = @"\u200b";
+
+void gio_showTextInput(CFTypeRef viewRef) {
+	GioView *view = (__bridge GioView *)viewRef;
+	UITextField *field = view.gioField;
+	if (field == nil) {
+		[view becomeFirstResponder];
+		return;
+	}
+	field.text = gioSentinel;
+	if (![field becomeFirstResponder]) {
+		[view becomeFirstResponder];
+	}
+}
+
+void gio_hideTextInput(CFTypeRef viewRef) {
+	GioView *view = (__bridge GioView *)viewRef;
+	UITextField *field = view.gioField;
+	if (field == nil || ![field isFirstResponder]) {
+		[view resignFirstResponder];
+		return;
+	}
+	[field resignFirstResponder];
+}
+
 @implementation GioView
 NSArray<UIKeyCommand *> *_keyCommands;
+
+- (instancetype)initWithFrame:(CGRect)frame {
+	self = [super initWithFrame:frame];
+	if (self == nil) {
+		return nil;
+	}
+	// Offscreen and nearly invisible. It cannot be hidden, or iOS will not
+	// make it first responder, and it must not sit on a touch target.
+	UITextField *field = [[UITextField alloc] initWithFrame:CGRectMake(0, -100, 2, 2)];
+	field.delegate = self;
+	field.alpha = 0.02f;
+	field.autocorrectionType = UITextAutocorrectionTypeNo;
+	field.autocapitalizationType = UITextAutocapitalizationTypeNone;
+	field.spellCheckingType = UITextSpellCheckingTypeNo;
+	field.smartQuotesType = UITextSmartQuotesTypeNo;
+	field.smartDashesType = UITextSmartDashesTypeNo;
+	field.smartInsertDeleteType = UITextSmartInsertDeleteTypeNo;
+	field.returnKeyType = UIReturnKeyDone;
+	field.text = gioSentinel;
+	[self addSubview:field];
+	self.gioField = field;
+	return self;
+}
+
+- (BOOL)textField:(UITextField *)textField shouldChangeCharactersInRange:(NSRange)range replacementString:(NSString *)string {
+	if (self.handle == 0) {
+		return NO;
+	}
+	if (string.length == 0) {
+		NSUInteger n = range.length;
+		// Index 0 is the sentinel. Do not let the field delete it.
+		if (range.location == 0 && n > 0) {
+			n--;
+		}
+		for (NSUInteger i = 0; i < n; i++) {
+			onDeleteBackward(self.handle);
+		}
+		return n > 0 && textField.text.length > range.length;
+	}
+	if (range.length > 0) {
+		NSUInteger n = range.length;
+		if (range.location == 0 && n > 0) {
+			n--;
+		}
+		for (NSUInteger i = 0; i < n; i++) {
+			onDeleteBackward(self.handle);
+		}
+	}
+	onText(self.handle, (__bridge CFTypeRef)string);
+	return YES;
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+	if (self.handle != 0) {
+		onText(self.handle, (__bridge CFTypeRef)@"\n");
+	}
+	return NO;
+}
+
 + (void)onFrameCallback:(CADisplayLink *)link {
        gio_onFrameCallback((__bridge CFTypeRef)link);
 }

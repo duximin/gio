@@ -45,14 +45,15 @@ static CFTypeRef readClipboard(void) {
 #endif
 }
 
+void gio_showTextInput(CFTypeRef viewRef);
+void gio_hideTextInput(CFTypeRef viewRef);
+
 static void showTextInput(CFTypeRef viewRef) {
-	UIView *view = (__bridge UIView *)viewRef;
-	[view becomeFirstResponder];
+	gio_showTextInput(viewRef);
 }
 
 static void hideTextInput(CFTypeRef viewRef) {
-	UIView *view = (__bridge UIView *)viewRef;
-	[view resignFirstResponder];
+	gio_hideTextInput(viewRef);
 }
 
 static struct drawParams viewDrawParams(CFTypeRef viewRef) {

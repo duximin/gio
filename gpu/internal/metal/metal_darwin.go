@@ -322,17 +322,19 @@ static CFTypeRef newSharedBGRA(CFTypeRef devRef, IOSurfaceRef surf, NSUInteger w
 																						height:height
 																					 mipmapped:NO];
 		desc.usage = MTLTextureUsageShaderRead;
+		MTLStorageMode storage = MTLStorageModeShared;
+#if TARGET_OS_OSX
 		BOOL unified = NO;
 		if ([dev respondsToSelector:@selector(hasUnifiedMemory)]) {
 			unified = dev.hasUnifiedMemory;
 		}
-		MTLStorageMode storage = MTLStorageModeShared;
 		if (!unified) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 			storage = MTLStorageModeManaged;
 #pragma clang diagnostic pop
 		}
+#endif
 		desc.storageMode = storage;
 		id<MTLTexture> tex = [dev newTextureWithDescriptor:desc iosurface:surf plane:0];
 		if (tex == nil) {
